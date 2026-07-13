@@ -134,6 +134,8 @@ spec:
             - --socket-path=/csi/csi.sock
             - --staging-dir=/var/lib/dev-csi/volumes
             - --http-addr=:8080
+            - --storage-api-url=http://localhost:8080
+            - --pool-size-tib=10
             - --v=4
           env:
             - name: NODE_NAME
