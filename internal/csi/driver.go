@@ -31,22 +31,24 @@ type FailConfig struct {
 
 // Config holds constructor options.
 type Config struct {
-	DriverName string
-	Version    string
-	NodeName   string
-	StagingDir string
-	Mounter    Mounter
+	DriverName     string
+	Version        string
+	NodeName       string
+	StagingDir     string
+	StorageAPIURL  string // URL of the storage API server (e.g. "http://localhost:8080")
+	Mounter        Mounter
 }
 
 // Driver implements CSI Identity, Controller, and Node in a single process.
 type Driver struct {
-	name       string
-	version    string
-	nodeName   string
-	stagingDir string
-	state      *State
-	mounter    Mounter
-	Fail       FailConfig
+	name          string
+	version       string
+	nodeName      string
+	stagingDir    string
+	state         *State          // tracks mount state only
+	storageClient *StorageClient  // delegates volume CRUD to the API server
+	mounter       Mounter
+	Fail          FailConfig
 
 	csipb.UnimplementedIdentityServer
 	csipb.UnimplementedControllerServer
@@ -70,13 +72,18 @@ func New(cfg Config) *Driver {
 	if m == nil {
 		m = &osMounter{}
 	}
+	var sc *StorageClient
+	if cfg.StorageAPIURL != "" {
+		sc = NewStorageClient(cfg.StorageAPIURL)
+	}
 	return &Driver{
-		name:       name,
-		version:    version,
-		nodeName:   cfg.NodeName,
-		stagingDir: stagingDir,
-		state:      NewState(),
-		mounter:    m,
+		name:          name,
+		version:       version,
+		nodeName:      cfg.NodeName,
+		stagingDir:    stagingDir,
+		state:         NewState(),
+		storageClient: sc,
+		mounter:       m,
 	}
 }
 

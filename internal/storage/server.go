@@ -1,29 +1,41 @@
-// Package storage provides an HTTP server that mimics the HPE Primera/3PAR WSAPI.
-// This allows the Forklift xcopy populator and CSI import plugin to run against
-// a fake storage array without real hardware.
+// Package storage provides an HTTP server mimicking HPE Primera/3PAR WSAPI.
+// This allows the Forklift xcopy populator and CSI import plugin to work
+// against a fake storage array with zero code changes — just set STORAGE_HOSTNAME.
 package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"k8s.io/klog/v2"
 )
 
-// NewServer returns an http.Handler implementing the minimal WSAPI surface
+// NewServer returns an http.Handler implementing the Primera3Par WSAPI surface
 // needed by the Forklift xcopy populator and HpeImporter CSI import plugin.
 func NewServer(state *State) http.Handler {
 	mux := http.NewServeMux()
 
+	// System info + capacity
+	mux.HandleFunc("/api/v1/system", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			handleSystem(w, r, state)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
 	// Session auth
 	mux.HandleFunc("/api/v1/credentials", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			handleCreateSession(w, r, state)
-		default:
-			http.NotFound(w, r)
+		if r.Method == http.MethodPost {
+			key := state.NewSessionKey()
+			writeJSON(w, http.StatusCreated, map[string]string{"key": key})
+			return
 		}
+		http.NotFound(w, r)
 	})
 	mux.HandleFunc("/api/v1/credentials/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
@@ -35,24 +47,62 @@ func NewServer(state *State) http.Handler {
 		http.NotFound(w, r)
 	})
 
-	// Volumes (CSI import: lookup by WWN/UUID; xcopy: lookup by name)
+	// Volumes — CRUD + snapshot/rename
 	mux.HandleFunc("/api/v1/volumes", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
+		switch r.Method {
+		case http.MethodGet:
 			handleListVolumes(w, r, state)
-			return
+		case http.MethodPost:
+			handleCreateVolume(w, r, state)
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	})
 	mux.HandleFunc("/api/v1/volumes/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			name := strings.TrimPrefix(r.URL.Path, "/api/v1/volumes/")
-			handleGetVolume(w, r, state, name)
-			return
+		name := strings.TrimPrefix(r.URL.Path, "/api/v1/volumes/")
+		switch r.Method {
+		case http.MethodGet:
+			handleGetVolume(w, state, name)
+		case http.MethodPost:
+			handleVolumeAction(w, r, state, name)
+		case http.MethodDelete:
+			if err := state.DeleteVolume(name); err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiErr(err.Error()))
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodPut:
+			handleRenameVolume(w, r, state, name)
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	})
 
-	// Hosts (xcopy: EnsureClonnerIgroup creates hosts)
+	// Tasks
+	mux.HandleFunc("/api/v1/tasks/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		idStr := strings.TrimPrefix(r.URL.Path, "/api/v1/tasks/")
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiErr("invalid task id"))
+			return
+		}
+		t, ok := state.GetTask(id)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, apiErr(fmt.Sprintf("task %d not found", id)))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":     t.ID,
+			"type":   1,
+			"status": atomic.LoadInt32(&t.State),
+		})
+	})
+
+	// Hosts
 	mux.HandleFunc("/api/v1/hosts", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
@@ -63,8 +113,16 @@ func NewServer(state *State) http.Handler {
 			http.NotFound(w, r)
 		}
 	})
+	mux.HandleFunc("/api/v1/hosts/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			name := strings.TrimPrefix(r.URL.Path, "/api/v1/hosts/")
+			handleGetHost(w, state, name)
+			return
+		}
+		http.NotFound(w, r)
+	})
 
-	// Host sets (xcopy: grouping)
+	// Host sets
 	mux.HandleFunc("/api/v1/hostsets", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleCreateHostSet(w, r, state)
@@ -81,13 +139,14 @@ func NewServer(state *State) http.Handler {
 		http.NotFound(w, r)
 	})
 
-	// VLUNs (xcopy: Map/UnMap)
+	// VLUNs
 	mux.HandleFunc("/api/v1/vluns", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
 			handleCreateVlun(w, r, state)
 		case http.MethodGet:
-			handleListVluns(w, r, state)
+			entries := state.ListVluns()
+			writeJSON(w, http.StatusOK, map[string]any{"total": len(entries), "members": entries})
 		default:
 			http.NotFound(w, r)
 		}
@@ -103,24 +162,30 @@ func NewServer(state *State) http.Handler {
 	return mux
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		klog.V(2).Infof("storage: JSON encode error: %v", err)
-	}
+// --- System ---
+
+func handleSystem(w http.ResponseWriter, _ *http.Request, s *State) {
+	totalMiB := s.PoolSizeMiB()
+	freeMiB := s.FreeMiB()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":              "DevStorage-001",
+		"name":            "DevStorage Fake Array",
+		"model":           "DevArray 9000",
+		"serialNumber":    "DEVSTG001",
+		"systemVersion":   "4.0.0.0",
+		"IPv4Addr":        "127.0.0.1",
+		"totalCapacityMiB": totalMiB,
+		"allocatedCapacityMiB": totalMiB - freeMiB,
+		"freeCapacityMiB": freeMiB,
+	})
 }
 
-func handleCreateSession(w http.ResponseWriter, _ *http.Request, s *State) {
-	key := s.NewSessionKey()
-	writeJSON(w, http.StatusCreated, map[string]string{"key": key})
-}
+// --- Volumes ---
 
 // handleListVolumes handles GET /api/v1/volumes?query=...
-// Supports queries: "wwn EQ <wwn>" and "uuid EQ <uuid>" (3PAR WSAPI format).
+// Supports 3PAR query syntax: `"wwn EQ <wwn>"` and `"uuid EQ <uuid>"`.
 func handleListVolumes(w http.ResponseWriter, r *http.Request, s *State) {
-	q := r.URL.Query().Get("query")
-	q = strings.Trim(q, `"`)
+	q := strings.Trim(r.URL.Query().Get("query"), `"`)
 
 	if q == "" {
 		vols := s.ListVolumes()
@@ -132,23 +197,22 @@ func handleListVolumes(w http.ResponseWriter, r *http.Request, s *State) {
 		return
 	}
 
-	parts := strings.Fields(q) // e.g. ["wwn", "EQ", "60002AC..."]
+	parts := strings.Fields(q)
 	if len(parts) != 3 {
 		writeJSON(w, http.StatusOK, map[string]any{"total": 0, "members": []any{}})
 		return
 	}
 	field, val := strings.ToLower(parts[0]), parts[2]
 
-	var found FakeVolume
-	var ok bool
+	var found *FakeVolume
 	switch field {
 	case "wwn":
-		found, ok = s.FindVolumeByWWN(val)
+		found, _ = s.FindVolumeByWWN(val)
 	case "uuid":
-		found, ok = s.FindVolumeByUUID(val)
+		found, _ = s.FindVolumeByUUID(val)
 	}
 
-	if !ok {
+	if found == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"total": 0, "members": []any{}})
 		return
 	}
@@ -158,33 +222,120 @@ func handleListVolumes(w http.ResponseWriter, r *http.Request, s *State) {
 	})
 }
 
-func handleGetVolume(w http.ResponseWriter, _ *http.Request, s *State, name string) {
+func handleGetVolume(w http.ResponseWriter, s *State, name string) {
 	v, ok := s.GetVolume(name)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"desc": "volume not found"})
+		writeJSON(w, http.StatusNotFound, apiErr("volume not found"))
 		return
 	}
 	writeJSON(w, http.StatusOK, volumeToMap(v))
 }
 
-func volumeToMap(v FakeVolume) map[string]any {
-	return map[string]any{
-		"name":            v.Name,
-		"wwn":             v.WWN,
-		"uuid":            v.UUID,
-		"sizeMiB":         v.Size / (1 << 20),
-		"provisioningType": 1,
+// handleCreateVolume handles POST /api/v1/volumes — creates a new LUN.
+func handleCreateVolume(w http.ResponseWriter, r *http.Request, s *State) {
+	var body struct {
+		Name    string `json:"name"`
+		SizeMiB int64  `json:"sizeMiB"`
+		// 3PAR also accepts cpg, tpvv, etc. — we ignore them.
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
+		return
+	}
+	if body.Name == "" {
+		writeJSON(w, http.StatusBadRequest, apiErr("name required"))
+		return
+	}
+
+	v, err := s.CreateVolume(body.Name, body.SizeMiB)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, apiErr(err.Error()))
+		return
+	}
+	klog.V(2).Infof("storage: created volume %s WWN=%s", v.Name, v.WWN)
+	writeJSON(w, http.StatusCreated, volumeToMap(v))
+}
+
+// handleVolumeAction handles POST /api/v1/volumes/:name — snapshot or promote.
+// Action 1 = create snapshot (3PAR: createPhysicalCopy or createVirtualCopy)
+// Action 4 = promote virtual copy (3PAR)
+func handleVolumeAction(w http.ResponseWriter, r *http.Request, s *State, srcName string) {
+	var body struct {
+		Action int    `json:"action"`
+		Name   string `json:"name"`   // destination name (for snapshot)
+		SnapCPG string `json:"snapCPG"` // ignored
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
+		return
+	}
+
+	switch body.Action {
+	case 1: // createVirtualCopy / snapshot
+		snapName := body.Name
+		if snapName == "" {
+			snapName = srcName + "-snap"
+		}
+		snap, err := s.CreateSnapshot(srcName, snapName)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, apiErr(err.Error()))
+			return
+		}
+		klog.V(2).Infof("storage: snapshot %s → %s", srcName, snapName)
+		writeJSON(w, http.StatusCreated, volumeToMap(snap))
+
+	case 4: // promoteVirtualCopy — returns a task
+		t := s.StartTask(2000, 4000) // 2-4 seconds
+		klog.V(2).Infof("storage: promote %s task %d started", srcName, t.ID)
+		writeJSON(w, http.StatusAccepted, map[string]any{"taskid": t.ID})
+
+	default:
+		writeJSON(w, http.StatusBadRequest, apiErr(fmt.Sprintf("unknown action %d", body.Action)))
 	}
 }
 
-func handleCreateHost(w http.ResponseWriter, r *http.Request, s *State) {
+// handleRenameVolume handles PUT /api/v1/volumes/:name with newName in body.
+func handleRenameVolume(w http.ResponseWriter, r *http.Request, s *State, oldName string) {
 	var body struct {
-		Name    string   `json:"name"`
-		FCPaths []struct{ WWN string } `json:"FCPaths"`
-		ISCSIPaths []struct{ Name string } `json:"iSCSIPaths"`
+		NewName string `json:"newName"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
+		return
+	}
+	if err := s.RenameVolume(oldName, body.NewName); err != nil {
+		writeJSON(w, http.StatusNotFound, apiErr(err.Error()))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func volumeToMap(v *FakeVolume) map[string]any {
+	return map[string]any{
+		"name":             v.Name,
+		"wwn":              v.WWN,
+		"uuid":             v.UUID,
+		"sizeMiB":          v.SizeMiB,
+		"provisioningType": 1,
+		"copyOf":          v.ParentName,
+		"snapCPG":          "fake-snap-cpg",
+	}
+}
+
+// --- Hosts ---
+
+func handleCreateHost(w http.ResponseWriter, r *http.Request, s *State) {
+	var body struct {
+		Name       string `json:"name"`
+		ISCSIPaths []struct {
+			Name string `json:"name"`
+		} `json:"iSCSIPaths"`
+		FCPaths []struct {
+			WWN string `json:"wwn"`
+		} `json:"FCPaths"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
 		return
 	}
 	var iqn string
@@ -195,16 +346,37 @@ func handleCreateHost(w http.ResponseWriter, r *http.Request, s *State) {
 	writeJSON(w, http.StatusCreated, map[string]string{"name": name})
 }
 
-func handleListHosts(w http.ResponseWriter, _ *http.Request, _ *State) {
+func handleListHosts(w http.ResponseWriter, r *http.Request, s *State) {
+	q := r.URL.Query().Get("query")
+	// Support query like `iscsiPaths[].name EQ <iqn>`
+	if strings.Contains(q, " EQ ") {
+		parts := strings.SplitN(q, " EQ ", 2)
+		iqn := strings.Trim(parts[1], `"`)
+		if name, ok := s.GetHostByIQN(iqn); ok {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"total": 1,
+				"members": []any{map[string]string{"name": name}},
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"total": 0, "members": []any{}})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"total": 0, "members": []any{}})
 }
+
+func handleGetHost(w http.ResponseWriter, s *State, name string) {
+	writeJSON(w, http.StatusOK, map[string]string{"name": name})
+}
+
+// --- Host sets ---
 
 func handleCreateHostSet(w http.ResponseWriter, r *http.Request, s *State) {
 	var body struct {
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
 		return
 	}
 	s.EnsureHostSet(body.Name)
@@ -216,7 +388,7 @@ func handleAddHostToSet(w http.ResponseWriter, r *http.Request, s *State, setNam
 		SetMembers []string `json:"setMembers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
 		return
 	}
 	for _, h := range body.SetMembers {
@@ -225,13 +397,16 @@ func handleAddHostToSet(w http.ResponseWriter, r *http.Request, s *State, setNam
 	w.WriteHeader(http.StatusOK)
 }
 
+// --- VLUNs ---
+
 func handleCreateVlun(w http.ResponseWriter, r *http.Request, s *State) {
 	var body struct {
-		VolumeName  string `json:"volumeName"`
-		Hostname    string `json:"hostname"`
+		VolumeName string `json:"volumeName"`
+		Hostname   string `json:"hostname"`
+		LunID      int    `json:"lun"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
 		return
 	}
 	lunID := s.MapLUN(body.VolumeName, body.Hostname)
@@ -243,21 +418,25 @@ func handleCreateVlun(w http.ResponseWriter, r *http.Request, s *State) {
 }
 
 func handleDeleteVlun(w http.ResponseWriter, r *http.Request, s *State) {
-	// path: /api/v1/vluns/<volumeName>,<lun>,<hostname>
+	// /api/v1/vluns/<volumeName>,<lun>,<hostname>
 	tail := strings.TrimPrefix(r.URL.Path, "/api/v1/vluns/")
 	parts := strings.SplitN(tail, ",", 3)
 	if len(parts) < 3 {
-		http.Error(w, "bad vlun path", http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, apiErr("bad vlun path, expected name,lun,host"))
 		return
 	}
 	s.UnmapLUN(parts[0], parts[2])
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func handleListVluns(w http.ResponseWriter, _ *http.Request, s *State) {
-	entries := s.ListVluns()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"total":   len(entries),
-		"members": entries,
-	})
+// --- helpers ---
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		klog.V(2).Infof("storage: JSON encode: %v", err)
+	}
 }
+
+func apiErr(msg string) map[string]string { return map[string]string{"desc": msg} }

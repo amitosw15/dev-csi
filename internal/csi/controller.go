@@ -21,43 +21,65 @@ func (d *Driver) CreateVolume(_ context.Context, req *csipb.CreateVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "volume name required")
 	}
 
-	if existing, ok := d.state.GetByName(name); ok {
-		klog.V(4).Infof("CreateVolume idempotent: %s", name)
-		vol := &csipb.Volume{VolumeId: existing.ID, CapacityBytes: existing.CapacityBytes}
-		if req.GetAccessibilityRequirements() != nil {
-			if p := req.GetAccessibilityRequirements().GetPreferred(); len(p) > 0 {
-				vol.AccessibleTopology = []*csipb.Topology{p[0]}
-			}
-		}
-		return &csipb.CreateVolumeResponse{Volume: vol}, nil
-	}
-
-	var cap int64
+	var capBytes int64
 	if cr := req.GetCapacityRange(); cr != nil {
-		cap = cr.GetRequiredBytes()
+		capBytes = cr.GetRequiredBytes()
 	}
-	if cap == 0 {
-		cap = 1 << 30
+	if capBytes == 0 {
+		capBytes = 1 << 30
+	}
+	sizeMiB := capBytes / (1 << 20)
+	if sizeMiB == 0 {
+		sizeMiB = 1
 	}
 
+	// If a storage client is configured, create the LUN on the API server.
+	// The volume name becomes the VolumeHandle so xcopy and CSI import can look it up.
+	if d.storageClient != nil {
+		if existing, ok := d.state.GetByName(name); ok {
+			klog.V(4).Infof("CreateVolume idempotent (local cache): %s", name)
+			return d.buildCreateResponse(existing.ID, existing.CapacityBytes, req), nil
+		}
+		storVol, err := d.storageClient.CreateVolume(name, sizeMiB)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "storage API: %v", err)
+		}
+		// Cache locally so NodePublishVolume can find it.
+		d.state.Add(Volume{ID: storVol.Name, Name: name, CapacityBytes: capBytes})
+		klog.V(2).Infof("CreateVolume: %s WWN=%s", storVol.Name, storVol.WWN)
+		return d.buildCreateResponse(storVol.Name, capBytes, req), nil
+	}
+
+	// Fallback: fully in-memory (no storage client configured).
+	if existing, ok := d.state.GetByName(name); ok {
+		return d.buildCreateResponse(existing.ID, existing.CapacityBytes, req), nil
+	}
 	id := fmt.Sprintf("dev-csi-vol-%s", name)
-	d.state.Add(Volume{ID: id, Name: name, CapacityBytes: cap})
-	klog.V(2).Infof("CreateVolume: %s (%d bytes)", id, cap)
+	d.state.Add(Volume{ID: id, Name: name, CapacityBytes: capBytes})
+	return d.buildCreateResponse(id, capBytes, req), nil
+}
 
-	vol := &csipb.Volume{VolumeId: id, CapacityBytes: cap}
+func (d *Driver) buildCreateResponse(id string, capBytes int64, req *csipb.CreateVolumeRequest) *csipb.CreateVolumeResponse {
+	vol := &csipb.Volume{VolumeId: id, CapacityBytes: capBytes}
 	if req.GetAccessibilityRequirements() != nil {
 		if p := req.GetAccessibilityRequirements().GetPreferred(); len(p) > 0 {
 			vol.AccessibleTopology = []*csipb.Topology{p[0]}
 		}
 	}
-	return &csipb.CreateVolumeResponse{Volume: vol}, nil
+	return &csipb.CreateVolumeResponse{Volume: vol}
 }
 
 func (d *Driver) DeleteVolume(_ context.Context, req *csipb.DeleteVolumeRequest) (*csipb.DeleteVolumeResponse, error) {
-	if req.GetVolumeId() == "" {
+	id := req.GetVolumeId()
+	if id == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID required")
 	}
-	d.state.Delete(req.GetVolumeId())
+	if d.storageClient != nil {
+		if err := d.storageClient.DeleteVolume(id); err != nil {
+			return nil, status.Errorf(codes.Internal, "storage API: %v", err)
+		}
+	}
+	d.state.Delete(id)
 	return &csipb.DeleteVolumeResponse{}, nil
 }
 

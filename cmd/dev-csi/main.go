@@ -17,12 +17,14 @@ import (
 
 func main() {
 	var (
-		driverName   = flag.String("driver-name", csi.DefaultDriverName, "CSI driver name")
-		version      = flag.String("version", "v0.1.0", "Driver version")
-		socketPath   = flag.String("socket-path", "/csi/csi.sock", "Unix socket path for CSI gRPC")
-		stagingDir   = flag.String("staging-dir", "/var/lib/dev-csi/volumes", "Per-volume staging dir")
-		httpAddr     = flag.String("http-addr", ":8080", "Address for HTTP storage API server")
-		volumesFile  = flag.String("volumes-file", "", "JSON file with seed volumes (see FakeVolume)")
+		driverName  = flag.String("driver-name", csi.DefaultDriverName, "CSI driver name")
+		version     = flag.String("version", "v0.1.0", "Driver version")
+		socketPath  = flag.String("socket-path", "/csi/csi.sock", "Unix socket path for CSI gRPC")
+		stagingDir  = flag.String("staging-dir", "/var/lib/dev-csi/volumes", "Per-volume staging dir")
+		httpAddr    = flag.String("http-addr", ":8080", "Address for HTTP storage API server")
+		volumesFile    = flag.String("volumes-file", "", "JSON file with seed volumes (see FakeVolume)")
+		poolSizeTiB   = flag.Int64("pool-size-tib", 10, "Storage pool size in TiB")
+		storageAPIURL = flag.String("storage-api-url", "http://localhost:8080", "URL of storage API server (used by CSI driver)")
 	)
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -43,7 +45,7 @@ func main() {
 		klog.Infof("seeded %d fake volumes from %s", len(seed), *volumesFile)
 	}
 
-	storageState := storage.NewState(seed)
+	storageState := storage.NewState(*poolSizeTiB*1024*1024, seed)
 
 	// Start HTTP storage API server.
 	httpSrv := &http.Server{
@@ -63,10 +65,11 @@ func main() {
 
 	// Start CSI gRPC driver.
 	d := csi.New(csi.Config{
-		DriverName: *driverName,
-		Version:    *version,
-		NodeName:   os.Getenv("NODE_NAME"),
-		StagingDir: *stagingDir,
+		DriverName:    *driverName,
+		Version:       *version,
+		NodeName:      os.Getenv("NODE_NAME"),
+		StagingDir:    *stagingDir,
+		StorageAPIURL: *storageAPIURL,
 	})
 	if err := d.Serve(ctx, *socketPath, nil); err != nil && ctx.Err() == nil {
 		klog.Fatalf("CSI driver: %v", err)
