@@ -1,0 +1,195 @@
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: dev-csi.amitosw15.io
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Persistent
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: dev-csi-immediate
+provisioner: dev-csi.amitosw15.io
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: dev-csi-wffc
+provisioner: dev-csi.amitosw15.io
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dev-csi
+  namespace: openshift-mtv
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dev-csi
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, create, delete, patch]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, watch, update]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, csinodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events, nodes]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dev-csi
+subjects:
+  - kind: ServiceAccount
+    name: dev-csi
+    namespace: openshift-mtv
+roleRef:
+  kind: ClusterRole
+  name: dev-csi
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Privileged SCC — needed for bind-mounts on OpenShift
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dev-csi-scc
+subjects:
+  - kind: ServiceAccount
+    name: dev-csi
+    namespace: openshift-mtv
+roleRef:
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Service — exposes the HTTP storage API inside the cluster.
+# Forklift xcopy populator and CSI import plugin use:
+#   STORAGE_HOSTNAME=http://dev-csi.openshift-mtv.svc:8080
+#   STORAGE_VENDOR=primera3par
+apiVersion: v1
+kind: Service
+metadata:
+  name: dev-csi
+  namespace: openshift-mtv
+spec:
+  selector:
+    app: dev-csi
+  ports:
+    - name: storage-api
+      port: 8080
+      targetPort: 8080
+
+---
+# DaemonSet — runs on every node so NodePublishVolume works cluster-wide.
+# external-provisioner uses leader election so only one pod handles CreateVolume.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dev-csi
+  namespace: openshift-mtv
+  labels:
+    app: dev-csi
+spec:
+  selector:
+    matchLabels:
+      app: dev-csi
+  template:
+    metadata:
+      labels:
+        app: dev-csi
+    spec:
+      serviceAccountName: dev-csi
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        # 1. dev-csi binary: CSI gRPC + HTTP storage API
+        - name: dev-csi
+          image: quay.io/amitosw15/dev-csi:devel
+          args:
+            - --socket-path=/csi/csi.sock
+            - --staging-dir=/var/lib/dev-csi/volumes
+            - --http-addr=:8080
+            - --v=4
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: storage-api
+              containerPort: 8080
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: staging-dir
+              mountPath: /var/lib/dev-csi/volumes
+              mountPropagation: Bidirectional
+
+        # 2. node-driver-registrar — tells kubelet about our socket
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/dev-csi.amitosw15.io/csi.sock
+            - --v=4
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+
+        # 3. external-provisioner — watches PVCs and calls CreateVolume
+        - name: external-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --v=4
+            - --feature-gates=Topology=true
+            - --leader-election
+            - --leader-election-namespace=openshift-mtv
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/dev-csi.amitosw15.io
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: staging-dir
+          hostPath:
+            path: /var/lib/dev-csi/volumes
+            type: DirectoryOrCreate
