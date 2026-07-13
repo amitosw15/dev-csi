@@ -1,0 +1,27 @@
+{{- if .Values.storageClasses.immediate.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClasses.immediate.name }}
+  labels:
+    app.kubernetes.io/name: dev-csi
+    app.kubernetes.io/managed-by: Helm
+provisioner: {{ .Values.driverName }}
+volumeBindingMode: Immediate
+reclaimPolicy: {{ .Values.storageClasses.immediate.reclaimPolicy }}
+allowVolumeExpansion: false
+{{- end }}
+---
+{{- if .Values.storageClasses.wffc.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClasses.wffc.name }}
+  labels:
+    app.kubernetes.io/name: dev-csi
+    app.kubernetes.io/managed-by: Helm
+provisioner: {{ .Values.driverName }}
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: {{ .Values.storageClasses.wffc.reclaimPolicy }}
+allowVolumeExpansion: false
+{{- end }}

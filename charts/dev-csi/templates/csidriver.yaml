@@ -1,0 +1,12 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ .Values.driverName }}
+  labels:
+    app.kubernetes.io/name: dev-csi
+    app.kubernetes.io/managed-by: Helm
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Persistent

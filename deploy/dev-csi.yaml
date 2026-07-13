@@ -129,7 +129,7 @@ spec:
       containers:
         # 1. dev-csi binary: CSI gRPC + HTTP storage API
         - name: dev-csi
-          image: quay.io/amitosw15/dev-csi:devel
+          image: quay.io/amitos/dev-csi:devel
           args:
             - --socket-path=/csi/csi.sock
             - --staging-dir=/var/lib/dev-csi/volumes

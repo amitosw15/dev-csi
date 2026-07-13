@@ -1,0 +1,13 @@
+{{- if .Values.seedVolumes }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dev-csi-seed-volumes
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: dev-csi
+    app.kubernetes.io/managed-by: Helm
+data:
+  volumes.json: |
+    {{ .Values.seedVolumes | toJson }}
+{{- end }}

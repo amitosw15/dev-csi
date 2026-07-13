@@ -8,7 +8,7 @@ on:
       - main
 
 env:
-  IMAGE: quay.io/amitosw15/dev-csi
+  IMAGE: quay.io/amitos/dev-csi
 
 jobs:
   build-push:
@@ -64,5 +64,5 @@ jobs:
 
             ### Image
             ```
-            quay.io/amitosw15/dev-csi:${{ steps.tags.outputs.version }}
+            quay.io/amitos/dev-csi:${{ steps.tags.outputs.version }}
             ```

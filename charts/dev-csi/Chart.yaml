@@ -1,0 +1,14 @@
+apiVersion: v2
+name: dev-csi
+description: DevStorage — fake CSI driver + Primera3Par storage API for testing xcopy and CSI import flows
+type: application
+version: 0.1.0
+appVersion: "devel"
+keywords:
+  - csi
+  - storage
+  - testing
+  - forklift
+home: https://github.com/amitosw15/dev-csi
+sources:
+  - https://github.com/amitosw15/dev-csi

@@ -1,4 +1,4 @@
-IMAGE ?= quay.io/amitosw15/dev-csi:devel
+IMAGE ?= quay.io/amitos/dev-csi:devel
 NAMESPACE ?= openshift-mtv
 
 .PHONY: build test image push deploy undeploy

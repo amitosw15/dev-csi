@@ -1,0 +1,40 @@
+# DevStorage CSI driver — Helm values
+image:
+  repository: quay.io/amitos/dev-csi
+  tag: devel
+  pullPolicy: Always
+
+# Kubernetes namespace to deploy into
+namespace: openshift-mtv
+
+# Storage pool size in TiB
+poolSizeTiB: 10
+
+# CSI driver name (also used in StorageClass provisioner field)
+driverName: dev-csi.amitosw15.io
+
+# Sidecar images (from kubernetes-csi)
+sidecars:
+  provisioner:
+    image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+  nodeDriverRegistrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+
+# StorageClasses to create
+storageClasses:
+  immediate:
+    enabled: true
+    name: dev-csi-immediate
+    reclaimPolicy: Delete
+  wffc:
+    enabled: true
+    name: dev-csi-wffc
+    reclaimPolicy: Delete
+
+# Seed volumes loaded at startup (JSON array passed via ConfigMap)
+# Each entry: { "Name": "vol-001", "WWN": "60002AC...", "UUID": "...", "SizeMiB": 10240 }
+seedVolumes: []
+# - Name: "test-vol-001"
+#   WWN: "60002AC000000000000000010000B5D6"
+#   UUID: "550e8400-e29b-41d4-a716-446655440000"
+#   SizeMiB: 10240
