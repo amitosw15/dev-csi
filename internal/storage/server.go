@@ -70,7 +70,7 @@ func newServer(state *State) *http.ServeMux {
 		http.NotFound(w, r)
 	})
 
-	// Volumes — CRUD + snapshot/rename
+	// Volumes — CRUD + snapshot/rename/promoteVirtualCopy
 	mux.HandleFunc("/api/v1/volumes", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -87,15 +87,19 @@ func newServer(state *State) *http.ServeMux {
 		case http.MethodGet:
 			handleGetVolume(w, state, name)
 		case http.MethodPost:
-			handleVolumeAction(w, r, state, name)
+			// POST /volumes/:name — createSnapshot
+			// body: {"action":"createSnapshot","parameters":{"name":"snapName"}}
+			handleVolumePost(w, r, state, name)
+		case http.MethodPut:
+			// PUT /volumes/:name — rename (newName), setSnapCPG (snapCPG), or promoteVirtualCopy (action:4)
+			handleVolumePut(w, r, state, name)
 		case http.MethodDelete:
+			klog.Infof("storage: DeleteVolume %s", name)
 			if err := state.DeleteVolume(name); err != nil {
 				writeJSON(w, http.StatusInternalServerError, apiErr(err.Error()))
 				return
 			}
-			w.WriteHeader(http.StatusNoContent)
-		case http.MethodPut:
-			handleRenameVolume(w, r, state, name)
+			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
@@ -153,13 +157,22 @@ func newServer(state *State) *http.ServeMux {
 		}
 		http.NotFound(w, r)
 	})
+	// GET /hostsets/:name — existence check (EnsureHostSetExists)
+	// PUT /hostsets/:name — add members (AddHostToHostSet uses action:1 + setmembers:[...])
 	mux.HandleFunc("/api/v1/hostsets/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			name := strings.TrimPrefix(r.URL.Path, "/api/v1/hostsets/")
+		name := strings.TrimPrefix(r.URL.Path, "/api/v1/hostsets/")
+		switch r.Method {
+		case http.MethodGet:
+			if state.HostSetExists(name) {
+				writeJSON(w, http.StatusOK, map[string]string{"name": name})
+			} else {
+				writeJSON(w, http.StatusNotFound, apiErr("host set not found"))
+			}
+		case http.MethodPut:
 			handleAddHostToSet(w, r, state, name)
-			return
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	})
 
 	// VLUNs
@@ -187,19 +200,25 @@ func newServer(state *State) *http.ServeMux {
 
 // --- System ---
 
+// wsApiBuild2023 is the Primera3Par WSAPI build threshold used in CopyVolume:
+// if build >= this value, snapCPG doesn't need to be pre-set on the source volume.
+// Return a value >= 2023 so CopyVolume skips the setVolumeSnapCPG call.
+const wsApiBuild2023 = 30303040
+
 func handleSystem(w http.ResponseWriter, _ *http.Request, s *State) {
 	totalMiB := s.PoolSizeMiB()
 	freeMiB := s.FreeMiB()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":              "DevStorage-001",
-		"name":            "DevStorage Fake Array",
-		"model":           "DevArray 9000",
-		"serialNumber":    "DEVSTG001",
-		"systemVersion":   "4.0.0.0",
-		"IPv4Addr":        "127.0.0.1",
-		"totalCapacityMiB": totalMiB,
+		"id":                   "DevStorage-001",
+		"name":                 "DevStorage Fake Array",
+		"model":                "DevArray 9000",
+		"serialNumber":         "DEVSTG001",
+		"systemVersion":        "4.0.0.0",
+		"IPv4Addr":             "127.0.0.1",
+		"build":                wsApiBuild2023 + 1, // >= wsApiBuild2023 so CopyVolume skips setSnapCPG
+		"totalCapacityMiB":     totalMiB,
 		"allocatedCapacityMiB": totalMiB - freeMiB,
-		"freeCapacityMiB": freeMiB,
+		"freeCapacityMiB":      freeMiB,
 	})
 }
 
@@ -281,59 +300,76 @@ func handleCreateVolume(w http.ResponseWriter, r *http.Request, s *State) {
 	writeJSON(w, http.StatusCreated, volumeToMap(v))
 }
 
-// handleVolumeAction handles POST /api/v1/volumes/:name — snapshot or promote.
-// Action 1 = create snapshot (3PAR: createPhysicalCopy or createVirtualCopy)
-// Action 4 = promote virtual copy (3PAR)
-func handleVolumeAction(w http.ResponseWriter, r *http.Request, s *State, srcName string) {
-	klog.Infof("storage: VolumeAction src=%s", srcName)
+// handleVolumePost handles POST /api/v1/volumes/:name — createSnapshot.
+// Primera3Par format: {"action":"createSnapshot","parameters":{"name":"snapName"}}
+func handleVolumePost(w http.ResponseWriter, r *http.Request, s *State, srcName string) {
+	klog.Infof("storage: VolumePost (snapshot) src=%s", srcName)
 	var body struct {
-		Action int    `json:"action"`
-		Name   string `json:"name"`   // destination name (for snapshot)
-		SnapCPG string `json:"snapCPG"` // ignored
+		Action     string         `json:"action"`
+		Parameters map[string]any `json:"parameters"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
 		return
 	}
 
-	switch body.Action {
-	case 1: // createVirtualCopy / snapshot
-		snapName := body.Name
-		if snapName == "" {
-			snapName = srcName + "-snap"
-		}
-		snap, err := s.CreateSnapshot(srcName, snapName)
-		if err != nil {
-			writeJSON(w, http.StatusNotFound, apiErr(err.Error()))
-			return
-		}
-		klog.V(2).Infof("storage: snapshot %s → %s", srcName, snapName)
-		writeJSON(w, http.StatusCreated, volumeToMap(snap))
-
-	case 4: // promoteVirtualCopy — returns a task
-		t := s.StartTask(2000, 4000) // 2-4 seconds
-		klog.V(2).Infof("storage: promote %s task %d started", srcName, t.ID)
-		writeJSON(w, http.StatusAccepted, map[string]any{"taskid": t.ID})
-
-	default:
-		writeJSON(w, http.StatusBadRequest, apiErr(fmt.Sprintf("unknown action %d", body.Action)))
-	}
-}
-
-// handleRenameVolume handles PUT /api/v1/volumes/:name with newName in body.
-func handleRenameVolume(w http.ResponseWriter, r *http.Request, s *State, oldName string) {
-	var body struct {
-		NewName string `json:"newName"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
+	if body.Action != "createSnapshot" {
+		writeJSON(w, http.StatusBadRequest, apiErr(fmt.Sprintf("unknown action %q", body.Action)))
 		return
 	}
-	if err := s.RenameVolume(oldName, body.NewName); err != nil {
+
+	snapName, _ := body.Parameters["name"].(string)
+	if snapName == "" {
+		snapName = srcName + "-snap"
+	}
+	snap, err := s.CreateSnapshot(srcName, snapName)
+	if err != nil {
 		writeJSON(w, http.StatusNotFound, apiErr(err.Error()))
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	klog.Infof("storage: snapshot created %s → %s", srcName, snapName)
+	writeJSON(w, http.StatusCreated, volumeToMap(snap))
+}
+
+// handleVolumePut handles PUT /api/v1/volumes/:name.
+// Three sub-operations distinguished by body fields:
+//   - {"newName": "..."} → rename (renameVolume)
+//   - {"snapCPG": "..."} → set snap CPG (ignored, just return OK)
+//   - {"action": 4, "online": true} → promoteVirtualCopy (returns taskid)
+func handleVolumePut(w http.ResponseWriter, r *http.Request, s *State, name string) {
+	klog.Infof("storage: VolumePut name=%s", name)
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
+		return
+	}
+
+	if newName, ok := body["newName"].(string); ok && newName != "" {
+		klog.Infof("storage: rename %s → %s", name, newName)
+		if err := s.RenameVolume(name, newName); err != nil {
+			writeJSON(w, http.StatusNotFound, apiErr(err.Error()))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if _, ok := body["snapCPG"]; ok {
+		// setVolumeSnapCPG — our volumes always have snapCPG set, just acknowledge.
+		klog.V(2).Infof("storage: setSnapCPG %s (no-op)", name)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if action, ok := body["action"].(float64); ok && int(action) == 4 {
+		// promoteVirtualCopy
+		t := s.StartTask(2000, 4000)
+		klog.Infof("storage: promoteVirtualCopy %s task %d started", name, t.ID)
+		writeJSON(w, http.StatusAccepted, map[string]any{"taskid": t.ID})
+		return
+	}
+
+	writeJSON(w, http.StatusBadRequest, apiErr("unrecognised PUT body — expected newName, snapCPG, or action:4"))
 }
 
 func volumeToMap(v *FakeVolume) map[string]any {
@@ -353,6 +389,8 @@ func volumeToMap(v *FakeVolume) map[string]any {
 func handleCreateHost(w http.ResponseWriter, r *http.Request, s *State) {
 	var body struct {
 		Name       string `json:"name"`
+		ISCSINames []string `json:"iSCSINames"` // 3PAR create-host format
+		FCWWNs     []string `json:"FCWWNs"`     // 3PAR FC format
 		ISCSIPaths []struct {
 			Name string `json:"name"`
 		} `json:"iSCSIPaths"`
@@ -364,35 +402,91 @@ func handleCreateHost(w http.ResponseWriter, r *http.Request, s *State) {
 		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
 		return
 	}
-	var iqn string
-	if len(body.ISCSIPaths) > 0 {
-		iqn = body.ISCSIPaths[0].Name
+
+	iqns := body.ISCSINames
+	for _, p := range body.ISCSIPaths {
+		iqns = append(iqns, p.Name)
 	}
-	name := s.EnsureHost(iqn)
-	writeJSON(w, http.StatusCreated, map[string]string{"name": name})
+	wwns := body.FCWWNs
+	for _, p := range body.FCPaths {
+		wwns = append(wwns, p.WWN)
+	}
+
+	var name string
+	if len(iqns) > 0 {
+		name = s.EnsureHostFull("", iqns, wwns)
+	} else if len(wwns) > 0 {
+		name = s.EnsureHostFull("", iqns, wwns)
+	} else {
+		name = body.Name
+		if name == "" {
+			name = "fake-host-unknown"
+		}
+		s.EnsureHostFull(name, nil, nil)
+	}
+	klog.Infof("storage: CreateHost name=%s iqns=%v wwns=%v", name, iqns, wwns)
+	writeJSON(w, http.StatusCreated, hostToMap(&FakeHost{Name: name, ISCSIIQNs: iqns, FCWWNs: wwns}))
 }
 
+// handleListHosts handles GET /api/v1/hosts and GET /api/v1/hosts?query=...
+// Primera3Par query format: `" iSCSIPaths[name EQ <iqn>] "` or `" FCPaths[wwn EQ <wwn>] "`
 func handleListHosts(w http.ResponseWriter, r *http.Request, s *State) {
-	q := r.URL.Query().Get("query")
-	// Support query like `iscsiPaths[].name EQ <iqn>`
-	if strings.Contains(q, " EQ ") {
-		parts := strings.SplitN(q, " EQ ", 2)
-		iqn := strings.Trim(parts[1], `"`)
-		if name, ok := s.GetHostByIQN(iqn); ok {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"total": 1,
-				"members": []any{map[string]string{"name": name}},
-			})
+	q := strings.Trim(r.URL.Query().Get("query"), `" `)
+	if q != "" {
+		// Try IQN filter
+		if strings.Contains(q, "iSCSIPaths") && strings.Contains(q, " EQ ") {
+			parts := strings.SplitN(q, " EQ ", 2)
+			iqn := strings.Trim(parts[1], ` "`)
+			if name, ok := s.GetHostByIQN(iqn); ok {
+				writeJSON(w, http.StatusOK, map[string]any{"total": 1, "members": []any{map[string]string{"name": name}}})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"total": 0, "members": []any{}})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"total": 0, "members": []any{}})
-		return
+		// Try FC WWN filter
+		if strings.Contains(q, "FCPaths") && strings.Contains(q, " EQ ") {
+			parts := strings.SplitN(q, " EQ ", 2)
+			wwn := strings.Trim(parts[1], ` "`)
+			if name, ok := s.GetHostByFCWWN(wwn); ok {
+				writeJSON(w, http.StatusOK, map[string]any{"total": 1, "members": []any{map[string]string{"name": name}}})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"total": 0, "members": []any{}})
+			return
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"total": 0, "members": []any{}})
+	// Return full list with ISCSIPaths/FCPaths for client-side filtering.
+	all := s.ListHosts()
+	members := make([]any, 0, len(all))
+	for _, h := range all {
+		members = append(members, hostToMap(h))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"total": len(members), "members": members})
 }
 
 func handleGetHost(w http.ResponseWriter, s *State, name string) {
+	if !s.HostExists(name) {
+		writeJSON(w, http.StatusNotFound, apiErr("host not found"))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"name": name})
+}
+
+func hostToMap(h *FakeHost) map[string]any {
+	iscsiPaths := make([]map[string]string, 0, len(h.ISCSIIQNs))
+	for _, iqn := range h.ISCSIIQNs {
+		iscsiPaths = append(iscsiPaths, map[string]string{"name": iqn})
+	}
+	fcPaths := make([]map[string]string, 0, len(h.FCWWNs))
+	for _, wwn := range h.FCWWNs {
+		fcPaths = append(fcPaths, map[string]string{"wwn": wwn})
+	}
+	return map[string]any{
+		"name":       h.Name,
+		"iSCSIPaths": iscsiPaths,
+		"FCPaths":    fcPaths,
+	}
 }
 
 // --- Host sets ---
@@ -409,15 +503,20 @@ func handleCreateHostSet(w http.ResponseWriter, r *http.Request, s *State) {
 	writeJSON(w, http.StatusCreated, map[string]string{"name": body.Name})
 }
 
+// handleAddHostToSet handles PUT /api/v1/hostsets/:name
+// Primera3Par format: {"action":1,"setmembers":["host1","host2"]}
 func handleAddHostToSet(w http.ResponseWriter, r *http.Request, s *State, setName string) {
 	var body struct {
-		SetMembers []string `json:"setMembers"`
+		Action     int      `json:"action"`
+		SetMembers []string `json:"setmembers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
 		return
 	}
+	s.EnsureHostSet(setName)
 	for _, h := range body.SetMembers {
+		klog.Infof("storage: AddHostToSet set=%s host=%s", setName, h)
 		s.AddHostToSet(setName, h)
 	}
 	w.WriteHeader(http.StatusOK)

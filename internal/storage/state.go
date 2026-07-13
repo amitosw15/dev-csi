@@ -36,11 +36,18 @@ type Task struct {
 	State int32 // TaskStateActive / TaskStateDone / TaskStateFailed
 }
 
+// FakeHost represents an iSCSI or FC host on the array.
+type FakeHost struct {
+	Name      string
+	ISCSIIQNs []string // iSCSI initiator names
+	FCWWNs    []string // FC port WWNs
+}
+
 // State is the single source of truth for the DevStorage fake array.
 type State struct {
 	mu       sync.RWMutex
 	volumes  map[string]*FakeVolume // name → volume
-	hosts    map[string][]string    // hostName → []IQN
+	hosts    map[string]*FakeHost   // hostName → host
 	hostSets map[string][]string    // hostSetName → []hostName
 	vluns    map[string][]vlunEntry // lunName → []vlunEntry
 	sessions map[string]struct{}    // active session keys
@@ -54,6 +61,7 @@ type State struct {
 type vlunEntry struct {
 	HostSetName string
 	LunID       int
+	Serial      string // fake NAA serial derived from volume+host
 }
 
 // NewState initialises the state with a pool size and optional seed volumes.
@@ -63,7 +71,7 @@ func NewState(poolSizeMiB int64, seed []FakeVolume) *State {
 	}
 	s := &State{
 		volumes:     make(map[string]*FakeVolume),
-		hosts:       make(map[string][]string),
+		hosts:       make(map[string]*FakeHost),
 		hostSets:    make(map[string][]string),
 		vluns:       make(map[string][]vlunEntry),
 		sessions:    make(map[string]struct{}),
@@ -272,33 +280,100 @@ func (s *State) GetTask(id int) (*Task, bool) {
 
 // --- Hosts / HostSets ---
 
-func (s *State) EnsureHost(iqn string) string {
+// EnsureHost creates or retrieves a host by iSCSI IQN or FC WWN.
+func (s *State) EnsureHost(adapterId string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for name, iqns := range s.hosts {
-		for _, q := range iqns {
-			if equalCI(q, iqn) {
-				return name
+	for _, h := range s.hosts {
+		for _, q := range h.ISCSIIQNs {
+			if equalCI(q, adapterId) {
+				return h.Name
+			}
+		}
+		for _, w := range h.FCWWNs {
+			if equalCI(norm(w), norm(adapterId)) {
+				return h.Name
 			}
 		}
 	}
-	n := min(8, len(iqn))
-	name := "fake-host-" + iqn[:n]
-	s.hosts[name] = []string{iqn}
+	n := min(8, len(adapterId))
+	name := "fake-host-" + adapterId[:n]
+	h := &FakeHost{Name: name}
+	if strings.HasPrefix(strings.ToLower(adapterId), "iqn.") {
+		h.ISCSIIQNs = []string{adapterId}
+	} else {
+		h.FCWWNs = []string{adapterId}
+	}
+	s.hosts[name] = h
+	return name
+}
+
+// EnsureHostFull creates a host with explicit iSCSI IQNs and/or FC WWNs.
+// If name is empty, a name is derived from the first IQN or WWN.
+func (s *State) EnsureHostFull(name string, iqns, fcwwns []string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if name == "" {
+		if len(iqns) > 0 {
+			n := min(8, len(iqns[0]))
+			name = "fake-host-" + iqns[0][:n]
+		} else if len(fcwwns) > 0 {
+			n := min(8, len(fcwwns[0]))
+			name = "fake-host-" + fcwwns[0][:n]
+		} else {
+			name = "fake-host-unknown"
+		}
+	}
+	if h, ok := s.hosts[name]; ok {
+		h.ISCSIIQNs = append(h.ISCSIIQNs, iqns...)
+		h.FCWWNs = append(h.FCWWNs, fcwwns...)
+		return name
+	}
+	s.hosts[name] = &FakeHost{Name: name, ISCSIIQNs: iqns, FCWWNs: fcwwns}
 	return name
 }
 
 func (s *State) GetHostByIQN(iqn string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for name, iqns := range s.hosts {
-		for _, q := range iqns {
+	for _, h := range s.hosts {
+		for _, q := range h.ISCSIIQNs {
 			if equalCI(q, iqn) {
-				return name, true
+				return h.Name, true
 			}
 		}
 	}
 	return "", false
+}
+
+func (s *State) GetHostByFCWWN(wwn string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, h := range s.hosts {
+		for _, w := range h.FCWWNs {
+			if equalCI(norm(w), norm(wwn)) {
+				return h.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+func (s *State) ListHosts() []*FakeHost {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*FakeHost, 0, len(s.hosts))
+	for _, h := range s.hosts {
+		out = append(out, h)
+	}
+	return out
+}
+
+func (s *State) HostExists(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.hosts[name]
+	return ok
 }
 
 func (s *State) EnsureHostSet(name string) {
@@ -307,6 +382,13 @@ func (s *State) EnsureHostSet(name string) {
 	if _, ok := s.hostSets[name]; !ok {
 		s.hostSets[name] = []string{}
 	}
+}
+
+func (s *State) HostSetExists(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.hostSets[name]
+	return ok
 }
 
 func (s *State) AddHostToSet(setName, hostName string) {
@@ -332,7 +414,9 @@ func (s *State) MapLUN(volumeName, hostSetName string) int {
 		}
 	}
 	id := len(entries) + 1
-	s.vluns[volumeName] = append(entries, vlunEntry{HostSetName: hostSetName, LunID: id})
+	// Serial is an NAA identifier — derive from volume+host for determinism.
+	serial := "naa." + strings.ToLower(wwnFromName(volumeName+":"+hostSetName))
+	s.vluns[volumeName] = append(entries, vlunEntry{HostSetName: hostSetName, LunID: id, Serial: serial})
 	return id
 }
 
@@ -371,6 +455,7 @@ func (s *State) ListVluns() []map[string]any {
 				"hostname":   e.HostSetName,
 				"lun":        e.LunID,
 				"remoteName": e.HostSetName,
+				"serial":     e.Serial,
 				"type":       5,
 			})
 		}

@@ -174,8 +174,8 @@ func TestDeleteVolume(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/volumes/to-delete", nil)
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 200 or 204, got %d", resp.StatusCode)
 	}
 
 	// Get should now 404
@@ -235,9 +235,11 @@ func TestTaskPolling(t *testing.T) {
 	http.Post(srv.URL+"/api/v1/volumes", "application/json",
 		bytes.NewBufferString(`{"name":"src-vol","sizeMiB":100}`))
 
-	// Trigger a promote action (returns task)
-	resp, _ := http.Post(srv.URL+"/api/v1/volumes/src-vol", "application/json",
-		bytes.NewBufferString(`{"action":4}`))
+	// Trigger a promote action via PUT (action:4) — returns a task
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/v1/volumes/src-vol",
+		bytes.NewBufferString(`{"action":4,"online":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := http.DefaultClient.Do(req)
 	var taskBody map[string]any
 	json.NewDecoder(resp.Body).Decode(&taskBody)
 	resp.Body.Close()

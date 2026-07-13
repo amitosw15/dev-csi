@@ -1,0 +1,28 @@
+DevStorage License
+
+Copyright (c) 2025 Red Hat, Inc. All rights reserved.
+
+This software and associated documentation files (the "Software") are the
+proprietary property of Red Hat, Inc. and are provided for internal use,
+testing, and evaluation purposes only.
+
+RESTRICTIONS:
+
+1. You may not sell, sublicense, or distribute the Software or any derivative
+   works for commercial gain.
+
+2. You may not use the Software to provide a commercial service or product
+   to third parties without the prior written consent of Red Hat, Inc.
+
+3. Redistribution of the Software, with or without modification, is permitted
+   only in non-commercial contexts and must retain this copyright notice and
+   these restrictions in all copies or substantial portions of the Software.
+
+4. The Software is provided "as is", without warranty of any kind, express or
+   implied, including but not limited to the warranties of merchantability,
+   fitness for a particular purpose, and non-infringement. In no event shall
+   Red Hat, Inc. be liable for any claim, damages, or other liability, whether
+   in an action of contract, tort, or otherwise, arising from, out of, or in
+   connection with the Software or the use or other dealings in the Software.
+
+For licensing inquiries: migtoolkit-virt@redhat.com
