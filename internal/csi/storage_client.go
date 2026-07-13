@@ -51,6 +51,35 @@ func (c *StorageClient) CreateVolume(name string, sizeMiB int64) (storageVolume,
 	return storageVolume{}, fmt.Errorf("storage CreateVolume: HTTP %d: %s", resp.StatusCode, errBody["desc"])
 }
 
+// EnsureLocal fetches the volume from the API server and caches it in local state.
+// If the volume doesn't exist (e.g. API server restarted and lost in-memory state),
+// it auto-recreates it — safe for a fake/test driver.
+func (c *StorageClient) EnsureLocal(s *State, volID string) error {
+	resp, err := c.httpClient.Get(c.baseURL + "/api/v1/volumes/" + volID)
+	if err != nil {
+		return fmt.Errorf("fetch from API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// Volume not in API (e.g. after API server restart). Auto-recreate it
+		// so NodePublishVolume can proceed. The WWN will be re-derived from the name.
+		recreated, err := c.CreateVolume(volID, 1024)
+		if err != nil {
+			return fmt.Errorf("auto-recreate after API restart: %w", err)
+		}
+		s.Add(Volume{ID: recreated.Name, Name: recreated.Name, CapacityBytes: recreated.SizeMiB * (1 << 20)})
+		return nil
+	}
+
+	var vol storageVolume
+	if err := json.NewDecoder(resp.Body).Decode(&vol); err != nil {
+		return fmt.Errorf("decode API response: %w", err)
+	}
+	s.Add(Volume{ID: vol.Name, Name: vol.Name, CapacityBytes: vol.SizeMiB * (1 << 20)})
+	return nil
+}
+
 // DeleteVolume calls DELETE /api/v1/volumes/:name.
 func (c *StorageClient) DeleteVolume(name string) error {
 	req, _ := http.NewRequest(http.MethodDelete, c.baseURL+"/api/v1/volumes/"+name, nil)

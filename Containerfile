@@ -7,6 +7,7 @@ RUN --mount=type=cache,target=${GOCACHE},uid=1001 \
     go build -buildvcs=false -ldflags="-w -s" -o dev-csi ./cmd/dev-csi/
 
 FROM registry.access.redhat.com/ubi9-minimal:9.6-1752587672
+RUN microdnf install -y util-linux && microdnf clean all
 COPY --from=builder /app/dev-csi /usr/local/bin/dev-csi
 ENTRYPOINT ["/usr/local/bin/dev-csi"]
 LABEL \

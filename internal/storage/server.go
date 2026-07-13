@@ -17,6 +17,29 @@ import (
 // NewServer returns an http.Handler implementing the Primera3Par WSAPI surface
 // needed by the Forklift xcopy populator and HpeImporter CSI import plugin.
 func NewServer(state *State) http.Handler {
+	return logMiddleware(newServer(state))
+}
+
+func logMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		klog.V(2).Infof("storage API → %s %s", r.Method, r.URL.String())
+		lw := &loggingResponseWriter{ResponseWriter: w, code: 200}
+		next.ServeHTTP(lw, r)
+		klog.V(2).Infof("storage API ← %s %s %d", r.Method, r.URL.Path, lw.code)
+	})
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (lw *loggingResponseWriter) WriteHeader(code int) {
+	lw.code = code
+	lw.ResponseWriter.WriteHeader(code)
+}
+
+func newServer(state *State) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// System info + capacity
@@ -246,13 +269,15 @@ func handleCreateVolume(w http.ResponseWriter, r *http.Request, s *State) {
 		writeJSON(w, http.StatusBadRequest, apiErr("name required"))
 		return
 	}
+	klog.Infof("storage: CreateVolume name=%s sizeMiB=%d", body.Name, body.SizeMiB)
 
 	v, err := s.CreateVolume(body.Name, body.SizeMiB)
 	if err != nil {
+		klog.Errorf("storage: CreateVolume %s failed: %v", body.Name, err)
 		writeJSON(w, http.StatusConflict, apiErr(err.Error()))
 		return
 	}
-	klog.V(2).Infof("storage: created volume %s WWN=%s", v.Name, v.WWN)
+	klog.Infof("storage: created volume %s WWN=%s UUID=%s sizeMiB=%d", v.Name, v.WWN, v.UUID, v.SizeMiB)
 	writeJSON(w, http.StatusCreated, volumeToMap(v))
 }
 
@@ -260,6 +285,7 @@ func handleCreateVolume(w http.ResponseWriter, r *http.Request, s *State) {
 // Action 1 = create snapshot (3PAR: createPhysicalCopy or createVirtualCopy)
 // Action 4 = promote virtual copy (3PAR)
 func handleVolumeAction(w http.ResponseWriter, r *http.Request, s *State, srcName string) {
+	klog.Infof("storage: VolumeAction src=%s", srcName)
 	var body struct {
 		Action int    `json:"action"`
 		Name   string `json:"name"`   // destination name (for snapshot)
@@ -409,7 +435,9 @@ func handleCreateVlun(w http.ResponseWriter, r *http.Request, s *State) {
 		writeJSON(w, http.StatusBadRequest, apiErr(err.Error()))
 		return
 	}
+	klog.Infof("storage: MapLUN volume=%s host=%s", body.VolumeName, body.Hostname)
 	lunID := s.MapLUN(body.VolumeName, body.Hostname)
+	klog.Infof("storage: VLUN created volume=%s host=%s lunID=%d", body.VolumeName, body.Hostname, lunID)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"volumeName": body.VolumeName,
 		"hostname":   body.Hostname,

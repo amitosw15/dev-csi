@@ -11,12 +11,14 @@ import (
 )
 
 func (d *Driver) CreateVolume(_ context.Context, req *csipb.CreateVolumeRequest) (*csipb.CreateVolumeResponse, error) {
+	name := req.GetName()
+	klog.Infof("CreateVolume: name=%s hasStorageAPI=%v", name, d.storageClient != nil)
+
 	if d.Fail.FailNextCreate {
 		d.Fail.FailNextCreate = false
+		klog.Warningf("CreateVolume: injected failure for %s", name)
 		return nil, status.Error(codes.Internal, "injected failure: CreateVolume")
 	}
-
-	name := req.GetName()
 	if name == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume name required")
 	}
@@ -32,30 +34,32 @@ func (d *Driver) CreateVolume(_ context.Context, req *csipb.CreateVolumeRequest)
 	if sizeMiB == 0 {
 		sizeMiB = 1
 	}
+	klog.V(2).Infof("CreateVolume: %s requesting %d MiB", name, sizeMiB)
 
-	// If a storage client is configured, create the LUN on the API server.
-	// The volume name becomes the VolumeHandle so xcopy and CSI import can look it up.
 	if d.storageClient != nil {
+		// Check local cache first (idempotent).
 		if existing, ok := d.state.GetByName(name); ok {
-			klog.V(4).Infof("CreateVolume idempotent (local cache): %s", name)
+			klog.Infof("CreateVolume: idempotent hit in local cache for %s (id=%s)", name, existing.ID)
 			return d.buildCreateResponse(existing.ID, existing.CapacityBytes, req), nil
 		}
 		storVol, err := d.storageClient.CreateVolume(name, sizeMiB)
 		if err != nil {
+			klog.Errorf("CreateVolume: storage API error for %s: %v", name, err)
 			return nil, status.Errorf(codes.Internal, "storage API: %v", err)
 		}
-		// Cache locally so NodePublishVolume can find it.
 		d.state.Add(Volume{ID: storVol.Name, Name: name, CapacityBytes: capBytes})
-		klog.V(2).Infof("CreateVolume: %s WWN=%s", storVol.Name, storVol.WWN)
+		klog.Infof("CreateVolume: created %s WWN=%s size=%dMiB", storVol.Name, storVol.WWN, sizeMiB)
 		return d.buildCreateResponse(storVol.Name, capBytes, req), nil
 	}
 
-	// Fallback: fully in-memory (no storage client configured).
+	// Fallback: fully in-memory.
 	if existing, ok := d.state.GetByName(name); ok {
+		klog.Infof("CreateVolume: idempotent (in-memory) for %s", name)
 		return d.buildCreateResponse(existing.ID, existing.CapacityBytes, req), nil
 	}
 	id := fmt.Sprintf("dev-csi-vol-%s", name)
 	d.state.Add(Volume{ID: id, Name: name, CapacityBytes: capBytes})
+	klog.Infof("CreateVolume: created in-memory %s", id)
 	return d.buildCreateResponse(id, capBytes, req), nil
 }
 
@@ -64,6 +68,7 @@ func (d *Driver) buildCreateResponse(id string, capBytes int64, req *csipb.Creat
 	if req.GetAccessibilityRequirements() != nil {
 		if p := req.GetAccessibilityRequirements().GetPreferred(); len(p) > 0 {
 			vol.AccessibleTopology = []*csipb.Topology{p[0]}
+			klog.V(2).Infof("CreateVolume: topology=%v", p[0].GetSegments())
 		}
 	}
 	return &csipb.CreateVolumeResponse{Volume: vol}
@@ -71,13 +76,16 @@ func (d *Driver) buildCreateResponse(id string, capBytes int64, req *csipb.Creat
 
 func (d *Driver) DeleteVolume(_ context.Context, req *csipb.DeleteVolumeRequest) (*csipb.DeleteVolumeResponse, error) {
 	id := req.GetVolumeId()
+	klog.Infof("DeleteVolume: id=%s", id)
 	if id == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID required")
 	}
 	if d.storageClient != nil {
 		if err := d.storageClient.DeleteVolume(id); err != nil {
+			klog.Errorf("DeleteVolume: storage API error for %s: %v", id, err)
 			return nil, status.Errorf(codes.Internal, "storage API: %v", err)
 		}
+		klog.Infof("DeleteVolume: deleted %s from storage API", id)
 	}
 	d.state.Delete(id)
 	return &csipb.DeleteVolumeResponse{}, nil
@@ -85,6 +93,7 @@ func (d *Driver) DeleteVolume(_ context.Context, req *csipb.DeleteVolumeRequest)
 
 func (d *Driver) ListVolumes(_ context.Context, _ *csipb.ListVolumesRequest) (*csipb.ListVolumesResponse, error) {
 	vols := d.state.List()
+	klog.V(2).Infof("ListVolumes: returning %d local entries", len(vols))
 	entries := make([]*csipb.ListVolumesResponse_Entry, 0, len(vols))
 	for _, v := range vols {
 		entries = append(entries, &csipb.ListVolumesResponse_Entry{
@@ -95,6 +104,7 @@ func (d *Driver) ListVolumes(_ context.Context, _ *csipb.ListVolumesRequest) (*c
 }
 
 func (d *Driver) ControllerGetCapabilities(_ context.Context, _ *csipb.ControllerGetCapabilitiesRequest) (*csipb.ControllerGetCapabilitiesResponse, error) {
+	klog.V(4).Info("ControllerGetCapabilities")
 	caps := []csipb.ControllerServiceCapability_RPC_Type{
 		csipb.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csipb.ControllerServiceCapability_RPC_LIST_VOLUMES,

@@ -109,6 +109,7 @@ spec:
       containers:
         - name: dev-csi-api
           image: quay.io/amitos/dev-csi:devel
+          imagePullPolicy: Always
           args:
             - --socket-path=          # no CSI gRPC — API only
             - --http-addr=:8080
@@ -164,6 +165,7 @@ spec:
         # 1. dev-csi in CSI-only mode (no local HTTP server)
         - name: dev-csi
           image: quay.io/amitos/dev-csi:devel
+          imagePullPolicy: Always
           args:
             - --socket-path=/csi/csi.sock
             - --staging-dir=/var/lib/dev-csi/volumes
