@@ -17,14 +17,15 @@ import (
 
 func main() {
 	var (
-		driverName  = flag.String("driver-name", csi.DefaultDriverName, "CSI driver name")
-		version     = flag.String("version", "v0.1.0", "Driver version")
-		socketPath  = flag.String("socket-path", "/csi/csi.sock", "Unix socket path for CSI gRPC")
-		stagingDir  = flag.String("staging-dir", "/var/lib/dev-csi/volumes", "Per-volume staging dir")
-		httpAddr    = flag.String("http-addr", ":8080", "Address for HTTP storage API server")
-		volumesFile    = flag.String("volumes-file", "", "JSON file with seed volumes (see FakeVolume)")
-		poolSizeTiB   = flag.Int64("pool-size-tib", 10, "Storage pool size in TiB")
-		storageAPIURL = flag.String("storage-api-url", "http://localhost:8080", "URL of storage API server (used by CSI driver)")
+		driverName    = flag.String("driver-name", csi.DefaultDriverName, "CSI driver name")
+		version       = flag.String("version", "v0.1.0", "Driver version")
+		socketPath    = flag.String("socket-path", "/csi/csi.sock", "Unix socket for CSI gRPC. Empty = skip CSI.")
+		stagingDir    = flag.String("staging-dir", "/var/lib/dev-csi/volumes", "Per-volume staging dir")
+		httpAddr      = flag.String("http-addr", ":8080", "Address for HTTP storage API. Empty = skip HTTP server.")
+		volumesFile   = flag.String("volumes-file", "", "JSON file with seed volumes")
+		poolSizeTiB   = flag.Int64("pool-size-tib", 10, "Storage pool size in TiB (API mode only)")
+		storageAPIURL = flag.String("storage-api-url", "", "URL of storage API server for CSI driver to call. "+
+			"Empty = CSI driver manages in-memory state locally (only valid when http-addr is also set).")
 	)
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -32,47 +33,54 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
-	// Load seed volumes from file if provided.
-	var seed []storage.FakeVolume
-	if *volumesFile != "" {
-		data, err := os.ReadFile(*volumesFile)
-		if err != nil {
-			klog.Fatalf("read volumes file: %v", err)
+	// --- HTTP storage API server (runs when --http-addr is set) ---
+	if *httpAddr != "" {
+		var seed []storage.FakeVolume
+		if *volumesFile != "" {
+			data, err := os.ReadFile(*volumesFile)
+			if err != nil {
+				klog.Fatalf("read volumes file: %v", err)
+			}
+			if err := json.Unmarshal(data, &seed); err != nil {
+				klog.Fatalf("parse volumes file: %v", err)
+			}
+			klog.Infof("seeded %d fake volumes from %s", len(seed), *volumesFile)
 		}
-		if err := json.Unmarshal(data, &seed); err != nil {
-			klog.Fatalf("parse volumes file: %v", err)
+
+		storageState := storage.NewState(*poolSizeTiB*1024*1024, seed)
+		httpSrv := &http.Server{
+			Addr:    *httpAddr,
+			Handler: storage.NewServer(storageState),
 		}
-		klog.Infof("seeded %d fake volumes from %s", len(seed), *volumesFile)
+		go func() {
+			klog.Infof("storage API listening on %s", *httpAddr)
+			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				klog.Errorf("HTTP server: %v", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			_ = httpSrv.Shutdown(context.Background())
+		}()
 	}
 
-	storageState := storage.NewState(*poolSizeTiB*1024*1024, seed)
-
-	// Start HTTP storage API server.
-	httpSrv := &http.Server{
-		Addr:    *httpAddr,
-		Handler: storage.NewServer(storageState),
-	}
-	go func() {
-		klog.Infof("storage API listening on %s", *httpAddr)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			klog.Errorf("HTTP server: %v", err)
+	// --- CSI gRPC driver (runs when --socket-path is set) ---
+	if *socketPath != "" {
+		d := csi.New(csi.Config{
+			DriverName:    *driverName,
+			Version:       *version,
+			NodeName:      os.Getenv("NODE_NAME"),
+			StagingDir:    *stagingDir,
+			StorageAPIURL: *storageAPIURL,
+		})
+		if err := d.Serve(ctx, *socketPath, nil); err != nil && ctx.Err() == nil {
+			klog.Fatalf("CSI driver: %v", err)
 		}
-	}()
-	go func() {
+	} else {
+		// API-only mode: block until signal.
+		klog.Info("running in API-only mode (no CSI socket)")
 		<-ctx.Done()
-		_ = httpSrv.Shutdown(context.Background())
-	}()
-
-	// Start CSI gRPC driver.
-	d := csi.New(csi.Config{
-		DriverName:    *driverName,
-		Version:       *version,
-		NodeName:      os.Getenv("NODE_NAME"),
-		StagingDir:    *stagingDir,
-		StorageAPIURL: *storageAPIURL,
-	})
-	if err := d.Serve(ctx, *socketPath, nil); err != nil && ctx.Err() == nil {
-		klog.Fatalf("CSI driver: %v", err)
 	}
+
 	fmt.Println("dev-csi stopped")
 }
